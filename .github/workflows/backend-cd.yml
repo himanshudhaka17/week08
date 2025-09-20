@@ -9,7 +9,7 @@ on:
         default: "latest"
 
 env:
-  # Change if your manifests use a different namespace (empty = default namespace)
+  # leave empty to use the default namespace
   NAMESPACE: ""
 
 jobs:
@@ -30,8 +30,7 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Derive ACR vars
-        id: acr
+      - name: Derive ACR + tag
         run: |
           echo "ACR_LOGIN_SERVER=${{ secrets.ACR_LOGIN_SERVER }}" >> $GITHUB_ENV
           echo "ACR_NAME=$(echo '${{ secrets.ACR_LOGIN_SERVER }}' | cut -d. -f1)" >> $GITHUB_ENV
@@ -43,74 +42,169 @@ jobs:
           resource-group: ${{ secrets.AKS_RG }}
           cluster-name:   ${{ secrets.AKS_CLUSTER }}
 
-      # harmless if already attached
-      - name: Attach ACR permissions
+      # harmless if already attached; won't fail the job
+      - name: Attach ACR permissions (best effort)
         run: |
-          az aks update -n "${{ secrets.AKS_CLUSTER }}" -g "${{ secrets.AKS_RG }}" --attach-acr "$ACR_NAME"
+          az aks update -n "${{ secrets.AKS_CLUSTER }}" -g "${{ secrets.AKS_RG }}" --attach-acr "$ACR_NAME" || true
 
-      - name: Create namespace if set (optional)
+      - name: Ensure namespace (optional)
         if: env.NAMESPACE != ''
         run: |
           kubectl get ns "$NAMESPACE" || kubectl create ns "$NAMESPACE"
 
-      - name: Apply backend manifests
+      # --- Ensure Postgres backends exist (creates or updates) ---
+      - name: Ensure product-db
         run: |
-          set -e
-          # If your k8s yaml files are elsewhere, adjust these paths.
-          if [ -d k8s ]; then
-            kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f k8s/
-          elif [ -d kubernetes/backend ]; then
-            kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f kubernetes/backend/
-          else
-            echo "::warning::No 'k8s' folder found. Continuing to set images/rollout."
-          fi
+          kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: { name: product-db }
+          spec:
+            replicas: 1
+            selector: { matchLabels: { app: product-db } }
+            template:
+              metadata: { labels: { app: product-db } }
+              spec:
+                containers:
+                  - name: postgres
+                    image: postgres:15
+                    env:
+                      - { name: POSTGRES_PASSWORD, value: "postgres" }
+                      - { name: POSTGRES_DB,       value: "products" }
+                    ports: [ { containerPort: 5432 } ]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: { name: product-db }
+          spec:
+            selector: { app: product-db }
+            ports: [ { port: 5432, targetPort: 5432 } ]
+          YAML
 
-      - name: Update images & rollout
+      - name: Ensure order-db
         run: |
-          set -e
+          kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: { name: order-db }
+          spec:
+            replicas: 1
+            selector: { matchLabels: { app: order-db } }
+            template:
+              metadata: { labels: { app: order-db } }
+              spec:
+                containers:
+                  - name: postgres
+                    image: postgres:15
+                    env:
+                      - { name: POSTGRES_PASSWORD, value: "postgres" }
+                      - { name: POSTGRES_DB,       value: "orders" }
+                    ports: [ { containerPort: 5432 } ]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: { name: order-db }
+          spec:
+            selector: { app: order-db }
+            ports: [ { port: 5432, targetPort: 5432 } ]
+          YAML
+
+      # --- Ensure product-service + order-service exist (creates or updates) ---
+      - name: Ensure product-service deployment & service
+        run: |
+          kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: { name: product-service }
+          spec:
+            replicas: 1
+            selector: { matchLabels: { app: product-service } }
+            template:
+              metadata: { labels: { app: product-service } }
+              spec:
+                containers:
+                  - name: product-service
+                    image: replace-later
+                    imagePullPolicy: Always
+                    env:
+                      - { name: POSTGRES_HOST, value: "product-db" }
+                      - { name: POSTGRES_PORT, value: "5432" }
+                      - { name: POSTGRES_DB,   value: "products" }
+                      - { name: POSTGRES_USER, value: "postgres" }
+                      - { name: POSTGRES_PASSWORD, value: "postgres" }
+                    ports: [ { containerPort: 3000 } ]
+                    readinessProbe: { httpGet: { path: /health, port: 3000 }, initialDelaySeconds: 5, periodSeconds: 10 }
+                    livenessProbe:  { httpGet: { path: /health, port: 3000 }, initialDelaySeconds: 10, periodSeconds: 20 }
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: { name: product-service }
+          spec:
+            type: LoadBalancer
+            selector: { app: product-service }
+            ports: [ { port: 80, targetPort: 3000 } ]
+          YAML
+
+      - name: Ensure order-service deployment & service
+        run: |
+          kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: { name: order-service }
+          spec:
+            replicas: 1
+            selector: { matchLabels: { app: order-service } }
+            template:
+              metadata: { labels: { app: order-service } }
+              spec:
+                containers:
+                  - name: order-service
+                    image: replace-later
+                    imagePullPolicy: Always
+                    env:
+                      - { name: POSTGRES_HOST, value: "order-db" }
+                      - { name: POSTGRES_PORT, value: "5432" }
+                      - { name: POSTGRES_DB,   value: "orders" }
+                      - { name: POSTGRES_USER, value: "postgres" }
+                      - { name: POSTGRES_PASSWORD, value: "postgres" }
+                    ports: [ { containerPort: 3001 } ]
+                    readinessProbe: { httpGet: { path: /health, port: 3001 }, initialDelaySeconds: 5, periodSeconds: 10 }
+                    livenessProbe:  { httpGet: { path: /health, port: 3001 }, initialDelaySeconds: 10, periodSeconds: 20 }
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: { name: order-service }
+          spec:
+            type: LoadBalancer
+            selector: { app: order-service }
+            ports: [ { port: 80, targetPort: 3001 } ]
+          YAML
+
+      - name: Set images to ACR tag and rollout
+        run: |
           ns_flag=""
           [ -n "$NAMESPACE" ] && ns_flag="-n $NAMESPACE"
-
-          # Image repos match CI pushes: product_service & order_service
           PRODUCT_IMG="${ACR_LOGIN_SERVER}/product_service:${TAG}"
           ORDER_IMG="${ACR_LOGIN_SERVER}/order_service:${TAG}"
 
-          # Try both common deployment names and both container names (dash/underscore)
-          for dep in product-service-w08e1 product-service; do
-            kubectl $ns_flag set image deploy/$dep product-service=$PRODUCT_IMG --record || true
-            kubectl $ns_flag set image deploy/$dep product_service=$PRODUCT_IMG --record || true
-            kubectl $ns_flag rollout status deploy/$dep --timeout=180s || true
-          done
+          kubectl $ns_flag set image deploy/product-service product-service="$PRODUCT_IMG" --record || true
+          kubectl $ns_flag set image deploy/order-service   order-service="$ORDER_IMG"   --record || true
 
-          for dep in order-service-w08e1 order-service; do
-            kubectl $ns_flag set image deploy/$dep order-service=$ORDER_IMG --record || true
-            kubectl $ns_flag set image deploy/$dep order_service=$ORDER_IMG --record || true
-            kubectl $ns_flag rollout status deploy/$dep --timeout=180s || true
-          done
+          kubectl $ns_flag rollout status deploy/product-service --timeout=240s || true
+          kubectl $ns_flag rollout status deploy/order-service   --timeout=240s || true
 
-      - name: Wait for LoadBalancer IPs (up to 5 minutes)
+      - name: Wait for LoadBalancer IPs (up to 6 minutes)
         id: capture_ips
         run: |
-          set -e
           ns_flag=""
           [ -n "$NAMESPACE" ] && ns_flag="-n $NAMESPACE"
 
-          svc_names_product=("product-service-w08e1" "product-service")
-          svc_names_order=("order-service-w08e1" "order-service")
-
           PRODUCT_IP=""
           ORDER_IP=""
-
-          for i in $(seq 1 60); do
-            echo "Attempt $i/60 to get external IPs ..."
-            for s in "${svc_names_product[@]}"; do
-              ip=$(kubectl $ns_flag get svc "$s" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-              [ -n "$ip" ] && PRODUCT_IP="$ip" && break
-            done
-            for s in "${svc_names_order[@]}"; do
-              ip=$(kubectl $ns_flag get svc "$s" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-              [ -n "$ip" ] && ORDER_IP="$ip" && break
-            done
+          for i in $(seq 1 72); do
+            echo "Attempt $i/72 to get external IPs ..."
+            PRODUCT_IP=$(kubectl $ns_flag get svc product-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            ORDER_IP=$(kubectl $ns_flag get svc order-service   -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
             if [ -n "$PRODUCT_IP" ] && [ -n "$ORDER_IP" ]; then
               echo "Product Service IP: $PRODUCT_IP"
               echo "Order Service IP:   $ORDER_IP"
@@ -130,5 +224,4 @@ jobs:
           echo "ORDER_IP=$ORDER_IP"     >> $GITHUB_ENV
 
       - name: Show services
-        run: |
-          kubectl ${NAMESPACE:+-n $NAMESPACE} get svc -o wide
+        run: kubectl ${NAMESPACE:+-n $NAMESPACE} get svc -o wide
