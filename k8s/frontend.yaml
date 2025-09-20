@@ -1,6 +1,5 @@
 # week08/k8s/frontend.yaml
 
-# week08/k8s/frontend.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -13,8 +12,8 @@ spec:
     metadata: { labels: { app: frontend } }
     spec:
       containers:
-        - name: frontend              # <- must be 'frontend'
-          image: nginx:alpine         # placeholder; CD sets ACR image
+        - name: frontend
+          image: nginx:alpine
           imagePullPolicy: IfNotPresent
           ports: [ { containerPort: 80 } ]
           readinessProbe: { httpGet: { path: /, port: 80 }, initialDelaySeconds: 5, periodSeconds: 10 }
@@ -23,7 +22,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: frontend                     # <- must be 'frontend'
+  name: frontend
   labels: { app: frontend }
 spec:
   type: LoadBalancer
@@ -32,3 +31,4 @@ spec:
     - name: http
       port: 80
       targetPort: 80
+
