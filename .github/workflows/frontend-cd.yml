@@ -10,7 +10,7 @@ on:
         default: "latest"
 
 env:
-  # leave empty to use default namespace
+  # Leave empty to use the default namespace
   NAMESPACE: ""
 
 jobs:
@@ -26,6 +26,35 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      # --- Inject backend IPs into the built JS before building the image ---
+      # Adjust the path to the file that contains the placeholders if needed.
+      - name: Inject Backend IPs into frontend bundle
+        run: |
+          set -e
+          echo "Replacing placeholders in frontend/main.js ..."
+          # Use / at the end to make URL-safe with new URL(...)
+          sed -i "s|_PRODUCT_API_URL_|http://4.237.211.110/|g" frontend/main.js
+          sed -i "s|_ORDER_API_URL_|http://4.254.28.11/|g" frontend/main.js
+          echo "Preview of main.js lines containing http://"
+          grep -n "http://" frontend/main.js || true
+
+      # --- Build & push the frontend image to ACR ---
+      - name: Login to ACR
+        env:
+          ACR_FQDN: ${{ secrets.ACR_LOGIN_SERVER }}   # e.g. sit722acr12345.azurecr.io
+        run: |
+          ACR_NAME=$(echo "$ACR_FQDN" | cut -d. -f1)
+          az acr login --name "$ACR_NAME"
+
+      - name: Build & Push Frontend Image
+        env:
+          ACR_FQDN: ${{ secrets.ACR_LOGIN_SERVER }}
+          TAG: ${{ github.event.inputs.image_tag || 'latest' }}
+        run: |
+          docker build -t "${ACR_FQDN}/frontend:${TAG}" ./frontend
+          docker push "${ACR_FQDN}/frontend:${TAG}"
+
+      # --- Set AKS context & (re)apply k8s objects ---
       - name: Set AKS context
         uses: azure/aks-set-context@v3
         with:
@@ -34,17 +63,20 @@ jobs:
 
       - name: Deploy/Update k8s resources
         run: |
-          # Apply your existing manifests (Deployment + Service)
           kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f k8s/frontend.yaml
 
-      - name: Roll to latest ACR image
+      - name: Roll to latest image
         env:
-          ACR: ${{ secrets.ACR_LOGIN_SERVER }}
+          ACR_FQDN: ${{ secrets.ACR_LOGIN_SERVER }}
           TAG: ${{ github.event.inputs.image_tag || 'latest' }}
         run: |
-          IMG="${ACR}/frontend:${TAG}"
+          IMG="${ACR_FQDN}/frontend:${TAG}"
           kubectl ${NAMESPACE:+-n $NAMESPACE} set image deploy/frontend frontend="$IMG" --record
           kubectl ${NAMESPACE:+-n $NAMESPACE} rollout status deploy/frontend --timeout=300s
 
       - name: Show service
-        run: kubectl ${NAMESPACE:+-n $NAMESPACE} get svc frontend -o wide
+        run: |
+          kubectl ${NAMESPACE:+-n $NAMESPACE} get svc frontend -o wide
+          echo
+          echo "Frontend IP:"
+          kubectl ${NAMESPACE:+-n $NAMESPACE} get svc frontend -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; echo
