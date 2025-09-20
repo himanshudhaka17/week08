@@ -10,148 +10,41 @@ on:
         default: "latest"
 
 env:
-  NAMESPACE: ""              # keep default namespace
-  PIP_NAME: w08-frontend-pip # static PIP to (re)use in the node RG
+  # leave empty to use default namespace
+  NAMESPACE: ""
 
 jobs:
   deploy_frontend:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Azure login
-        uses: azure/login@v2
+        uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Derive env (ACR, TAG, node RG)
-        shell: bash
-        run: |
-          echo "ACR_LOGIN_SERVER=${{ secrets.ACR_LOGIN_SERVER }}" >> $GITHUB_ENV
-          echo "TAG=${{ github.event.inputs.image_tag || 'latest' }}" >> $GITHUB_ENV
-          NODE_RG=$(az aks show -n "${{ secrets.AKS_CLUSTER }}" -g "${{ secrets.AKS_RG }}" --query nodeResourceGroup -o tsv)
-          echo "NODE_RG=$NODE_RG" >> $GITHUB_ENV
-          echo "Node RG: $NODE_RG"
-
       - name: Set AKS context
-        uses: azure/aks-set-context@v4
+        uses: azure/aks-set-context@v3
         with:
           resource-group: ${{ secrets.AKS_RG }}
           cluster-name:   ${{ secrets.AKS_CLUSTER }}
 
-      - name: Attach ACR to AKS (best effort)
-        shell: bash
+      - name: Deploy/Update k8s resources
         run: |
-          ACR_NAME=$(echo "${ACR_LOGIN_SERVER}" | cut -d. -f1)
-          az aks update -n "${{ secrets.AKS_CLUSTER }}" -g "${{ secrets.AKS_RG }}" --attach-acr "$ACR_NAME" || true
+          # Apply your existing manifests (Deployment + Service)
+          kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f k8s/frontend.yaml
 
-      - name: Ensure namespace (optional)
-        if: env.NAMESPACE != ''
+      - name: Roll to latest ACR image
+        env:
+          ACR: ${{ secrets.ACR_LOGIN_SERVER }}
+          TAG: ${{ github.event.inputs.image_tag || 'latest' }}
         run: |
-          kubectl get ns "$NAMESPACE" || kubectl create ns "$NAMESPACE"
+          IMG="${ACR}/frontend:${TAG}"
+          kubectl ${NAMESPACE:+-n $NAMESPACE} set image deploy/frontend frontend="$IMG" --record
+          kubectl ${NAMESPACE:+-n $NAMESPACE} rollout status deploy/frontend --timeout=300s
 
-      - name: Ensure frontend Deployment & Service
-        shell: bash
-        run: |
-          if [ -f k8s/frontend.yaml ]; then
-            kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f k8s/frontend.yaml
-          elif [ -d k8s/frontend ]; then
-            kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f k8s/frontend/
-          else
-            # write a minimal known-good manifest and apply it
-            cat >/tmp/frontend.yaml <<'YAML'
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: frontend
-  labels: { app: frontend }
-spec:
-  replicas: 1
-  selector: { matchLabels: { app: frontend } }
-  template:
-    metadata: { labels: { app: frontend } }
-    spec:
-      containers:
-        - name: frontend
-          image: nginx:alpine          # will be set to your ACR image below
-          ports: [ { containerPort: 80 } ]
-          readinessProbe: { httpGet: { path: /, port: 80 }, initialDelaySeconds: 5, periodSeconds: 10 }
-          livenessProbe:  { httpGet: { path: /, port: 80 }, initialDelaySeconds: 10, periodSeconds: 20 }
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: frontend
-  labels: { app: frontend }
-spec:
-  type: LoadBalancer
-  selector: { app: frontend }
-  ports: [ { port: 80, targetPort: 80 } ]
-YAML
-            kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f /tmp/frontend.yaml
-          fi
-
-      - name: Ensure/allocate static Public IP
-        shell: bash
-        run: |
-          if ! az network public-ip show -g "$NODE_RG" -n "$PIP_NAME" >/dev/null 2>&1; then
-            az network public-ip create -g "$NODE_RG" -n "$PIP_NAME" --sku Standard --allocation-method static
-          fi
-          PIP=$(az network public-ip show -g "$NODE_RG" -n "$PIP_NAME" --query ipAddress -o tsv)
-          echo "FRONTEND_PIP=$PIP" >> $GITHUB_ENV
-          echo "Using PIP: $PIP"
-
-      - name: Bind PIP to Service (annotation + loadBalancerIP)
-        shell: bash
-        run: |
-          kubectl annotate svc frontend service.beta.kubernetes.io/azure-load-balancer-resource-group="$NODE_RG" --overwrite || true
-          # Try patch first; if Service was created with different type/spec and patch fails, recreate Service with our settings.
-          if ! kubectl patch svc frontend -p '{"spec":{"type":"LoadBalancer","loadBalancerIP":"'"$FRONTEND_PIP"'"}}'; then
-            kubectl delete svc frontend --ignore-not-found
-            cat >/tmp/frontend-svc.yaml <<EOF
-apiVersion: v1
-kind: Service
-metadata:
-  name: frontend
-  labels: { app: frontend }
-  annotations:
-    service.beta.kubernetes.io/azure-load-balancer-resource-group: $NODE_RG
-spec:
-  type: LoadBalancer
-  loadBalancerIP: $FRONTEND_PIP
-  selector: { app: frontend }
-  ports:
-    - name: http
-      port: 80
-      targetPort: 80
-EOF
-            kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f /tmp/frontend-svc.yaml
-          fi
-
-      - name: Rollout image from ACR
-        shell: bash
-        run: |
-          IMG="${ACR_LOGIN_SERVER}/frontend:${TAG}"
-          kubectl ${NAMESPACE:+-n $NAMESPACE} set image deploy/frontend frontend="$IMG" --record || true
-          kubectl ${NAMESPACE:+-n $NAMESPACE} rollout status deploy/frontend --timeout=240s || true
-
-      - name: Wait for EXTERNAL-IP (soft wait)
-        shell: bash
-        run: |
-          echo "Waiting up to 5 minutes for EXTERNAL-IP..."
-          for i in {1..60}; do
-            IP=$(kubectl ${NAMESPACE:+-n $NAMESPACE} get svc frontend -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-            if [ -n "$IP" ]; then
-              echo "EXTERNAL-IP=$IP"
-              break
-            fi
-            sleep 5
-          done
-          kubectl ${NAMESPACE:+-n $NAMESPACE} get svc frontend -o wide
-
-      - name: Describe Service (diagnostics if still failing)
-        if: ${{ failure() }}
-        run: kubectl ${NAMESPACE:+-n $NAMESPACE} describe svc frontend || true
-
+      - name: Show service
+        run: kubectl ${NAMESPACE:+-n $NAMESPACE} get svc frontend -o wide
