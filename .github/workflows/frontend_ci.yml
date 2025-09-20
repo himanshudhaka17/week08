@@ -11,7 +11,7 @@ on:
       - '.github/workflows/frontend_ci.yml'
 
 env:
-  # Use the secret you actually created
+  # FQDN of your ACR, e.g. sit722acr1870.azurecr.io
   ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
   IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}
 
@@ -23,6 +23,28 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ⬇️ Patch backend IPs into the source BEFORE building the image
+      - name: Patch frontend/src/config.js with backend IPs
+        run: |
+          set -euo pipefail
+          FILE="frontend/src/config.js"
+          mkdir -p frontend/src
+          # Create if missing, otherwise replace existing values
+          if [ ! -f "$FILE" ]; then
+            cat > "$FILE" <<'EOF'
+export const PRODUCT_API_BASE = "http://4.237.211.110";
+export const ORDER_API_BASE   = "http://4.254.28.11";
+EOF
+          else
+            sed -E -i 's|export const PRODUCT_API_BASE[[:space:]]*=.*;|export const PRODUCT_API_BASE = "http://4.237.211.110";|g' "$FILE"
+            sed -E -i 's|export const ORDER_API_BASE[[:space:]]*=.*;|export const ORDER_API_BASE   = "http://4.254.28.11";|g' "$FILE"
+            grep -q 'PRODUCT_API_BASE' "$FILE" || echo 'export const PRODUCT_API_BASE = "http://4.237.211.110";' >> "$FILE"
+            grep -q 'ORDER_API_BASE'   "$FILE" || echo 'export const ORDER_API_BASE   = "http://4.254.28.11";' >> "$FILE"
+          fi
+          echo "===== resulting config.js ====="
+          cat "$FILE"
+
+      # Optional local (non-Docker) build if you keep a Node app here.
       - name: Setup Node (optional build step)
         uses: actions/setup-node@v4
         with:
@@ -44,7 +66,7 @@ jobs:
 
       - name: Login to ACR
         run: |
-          # az acr login expects the ACR NAME, not the FQDN
+          # az acr login expects the ACR NAME (left part of FQDN)
           ACR_NAME=$(echo "${{ env.ACR_LOGIN_SERVER }}" | cut -d. -f1)
           echo "Logging in to ACR: $ACR_NAME (from ${ACR_LOGIN_SERVER})"
           az acr login --name "$ACR_NAME"
@@ -56,7 +78,6 @@ jobs:
         env:
           IMG_BASE: ${{ env.ACR_LOGIN_SERVER }}/frontend
         run: |
-          # Requires a Dockerfile in ./frontend (see note below)
           docker build -t "$IMG_BASE:${{ env.IMAGE_TAG }}" -t "$IMG_BASE:latest" ./frontend
           docker push "$IMG_BASE:${{ env.IMAGE_TAG }}"
           docker push "$IMG_BASE:latest"
