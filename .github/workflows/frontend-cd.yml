@@ -1,6 +1,4 @@
 # week08/.github/workflows/frontend-cd.yml
-
-# .github/workflows/frontend-cd.yml
 name: CD - Deploy Frontend to AKS
 
 on:
@@ -12,8 +10,8 @@ on:
         default: "latest"
 
 env:
-  NAMESPACE: ""             # keep default namespace
-  PIP_NAME: w08-frontend-pip
+  NAMESPACE: ""              # keep default namespace
+  PIP_NAME: w08-frontend-pip # static PIP to (re)use in the node RG
 
 jobs:
   deploy_frontend:
@@ -54,7 +52,7 @@ jobs:
         run: |
           kubectl get ns "$NAMESPACE" || kubectl create ns "$NAMESPACE"
 
-      - name: Ensure frontend Deployment & Service exist
+      - name: Ensure frontend Deployment & Service
         shell: bash
         run: |
           if [ -f k8s/frontend.yaml ]; then
@@ -62,34 +60,39 @@ jobs:
           elif [ -d k8s/frontend ]; then
             kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f k8s/frontend/
           else
-            cat <<'YAML' | kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f -
-            apiVersion: apps/v1
-            kind: Deployment
-            metadata: { name: frontend, labels: { app: frontend } }
-            spec:
-              replicas: 1
-              selector: { matchLabels: { app: frontend } }
-              template:
-                metadata: { labels: { app: frontend } }
-                spec:
-                  containers:
-                    - name: frontend
-                      image: nginx:alpine
-                      ports: [ { containerPort: 80 } ]
-                      readinessProbe: { httpGet: { path: /, port: 80 }, initialDelaySeconds: 5, periodSeconds: 10 }
-                      livenessProbe:  { httpGet: { path: /, port: 80 }, initialDelaySeconds: 10, periodSeconds: 20 }
-            ---
-            apiVersion: v1
-            kind: Service
-            metadata: { name: frontend, labels: { app: frontend } }
-            spec:
-              type: LoadBalancer
-              selector: { app: frontend }
-              ports: [ { port: 80, targetPort: 80 } ]
-            YAML
+            # write a minimal known-good manifest and apply it
+            cat >/tmp/frontend.yaml <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  labels: { app: frontend }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: frontend } }
+  template:
+    metadata: { labels: { app: frontend } }
+    spec:
+      containers:
+        - name: frontend
+          image: nginx:alpine          # will be set to your ACR image below
+          ports: [ { containerPort: 80 } ]
+          readinessProbe: { httpGet: { path: /, port: 80 }, initialDelaySeconds: 5, periodSeconds: 10 }
+          livenessProbe:  { httpGet: { path: /, port: 80 }, initialDelaySeconds: 10, periodSeconds: 20 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  labels: { app: frontend }
+spec:
+  type: LoadBalancer
+  selector: { app: frontend }
+  ports: [ { port: 80, targetPort: 80 } ]
+YAML
+            kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f /tmp/frontend.yaml
           fi
 
-      # 1) Make sure we have ONE static PIP in the node RG (create if missing)
       - name: Ensure/allocate static Public IP
         shell: bash
         run: |
@@ -100,32 +103,31 @@ jobs:
           echo "FRONTEND_PIP=$PIP" >> $GITHUB_ENV
           echo "Using PIP: $PIP"
 
-      # 2) Ensure the frontend Service uses that PIP and the correct RG
       - name: Bind PIP to Service (annotation + loadBalancerIP)
         shell: bash
         run: |
           kubectl annotate svc frontend service.beta.kubernetes.io/azure-load-balancer-resource-group="$NODE_RG" --overwrite || true
-          # try patch; if immutable, recreate just the Service with the fixed spec
+          # Try patch first; if Service was created with different type/spec and patch fails, recreate Service with our settings.
           if ! kubectl patch svc frontend -p '{"spec":{"type":"LoadBalancer","loadBalancerIP":"'"$FRONTEND_PIP"'"}}'; then
-            echo "Recreating Service with static PIP…"
             kubectl delete svc frontend --ignore-not-found
-            cat <<EOF | kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f -
-            apiVersion: v1
-            kind: Service
-            metadata:
-              name: frontend
-              labels: { app: frontend }
-              annotations:
-                service.beta.kubernetes.io/azure-load-balancer-resource-group: $NODE_RG
-            spec:
-              type: LoadBalancer
-              loadBalancerIP: $FRONTEND_PIP
-              selector: { app: frontend }
-              ports:
-                - name: http
-                  port: 80
-                  targetPort: 80
-            EOF
+            cat >/tmp/frontend-svc.yaml <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  labels: { app: frontend }
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-resource-group: $NODE_RG
+spec:
+  type: LoadBalancer
+  loadBalancerIP: $FRONTEND_PIP
+  selector: { app: frontend }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+EOF
+            kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f /tmp/frontend-svc.yaml
           fi
 
       - name: Rollout image from ACR
@@ -152,3 +154,4 @@ jobs:
       - name: Describe Service (diagnostics if still failing)
         if: ${{ failure() }}
         run: kubectl ${NAMESPACE:+-n $NAMESPACE} describe svc frontend || true
+
