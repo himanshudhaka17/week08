@@ -2,92 +2,95 @@
 
 name: CD - Deploy Frontend to AKS
 
-# This workflow can be called by other workflows and takes inputs.
-# Or it can be run manually if you provide the IPs.
 on:
   workflow_dispatch:
     inputs:
-      product_api_ip:
-        description: 'External IP of Product Service'
-        required: true
-        default: 'http://<ip_address>:8000'
-      order_api_ip:
-        description: 'External IP of Order Service (e.g., http://Y.Y.Y.Y:8001)'
-        required: true
-        default: 'http://<ip_address>:8001'
-      aks_cluster_name:
-        description: 'Name of the AKS Cluster to deploy to'
-        required: true
-        default: '<aks_name>'
-      aks_resource_group:
-        description: 'Resource Group of the AKS Cluster'
-        required: true
-        default: '<<resource_group_name>'
+      image_tag:
+        description: "Image tag to deploy (default: latest)"
+        required: false
+        default: "latest"
 
-  workflow_call:
-    inputs:
-      product_api_ip:
-        required: true
-        type: string
-      order_api_ip:
-        required: true
-        type: string
-      aks_cluster_name:
-        required: true
-        type: string
-      aks_resource_group:
-        required: true
-        type: string
+env:
+  # leave empty to use the default namespace
+  NAMESPACE: ""
 
 jobs:
   deploy_frontend:
     runs-on: ubuntu-latest
-    environment: Production
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Azure login using a Service Principal secret
-      - name: Azure Login
-        uses: azure/login@v1
+      - name: Azure login
+        uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # Login to Azure Container Registry (ACR)
-      - name: Login to Azure Container Registry
-        run: az acr login --name ${{ secrets.AZURE_CONTAINER_REGISTRY }}
-
-      - name: Inject Backend IPs into Frontend main.js
+      - name: Derive ACR + tag
         run: |
-          echo "Injecting IPs into frontend/static/js/main.js"
-          # Ensure frontend/main.js is directly in the path for sed
-          sed -i "s|_PRODUCT_API_URL_|${{ inputs.product_api_ip }}|g" frontend/main.js
-          sed -i "s|_ORDER_API_URL_|${{ inputs.order_api_ip }}|g" frontend/main.js
-          
-          # Display the modified file content for debugging
-          echo "--- Modified main.js content ---"
-          cat frontend/main.js
-          echo "---------------------------------"
+          echo "ACR_LOGIN_SERVER=${{ secrets.ACR_LOGIN_SERVER }}" >> $GITHUB_ENV
+          echo "TAG=${{ github.event.inputs.image_tag || 'latest' }}" >> $GITHUB_ENV
 
-      # Build and Push Docker image for Frontend
-      - name: Build and Push Frontend Image
-        run: |
-          docker build -t ${{ secrets.AZURE_CONTAINER_REGISTRY }}/frontend:latest ./frontend/
-          docker push ${{ secrets.AZURE_CONTAINER_REGISTRY }}/frontend:latest
-
-      - name: Set Kubernetes context (get AKS credentials)
-        uses: azure/aks-set-context@v3
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
         with:
-          resource-group: ${{ inputs.aks_resource_group }}
-          cluster-name: ${{ inputs.aks_cluster_name }}
+          resource-group: ${{ secrets.AKS_RG }}
+          cluster-name:   ${{ secrets.AKS_CLUSTER }}
 
-      - name: Deploy Frontend to AKS
+      # Harmless if already attached; don't fail the job if it is.
+      - name: Attach ACR permissions (best effort)
         run: |
-          echo "Deploying frontend with latest tag to AKS cluster: ${{ inputs.aks_cluster_name }}"
-          cd k8s/
-          # Ensure frontend-service.yaml is configured with your ACR
-          kubectl apply -f frontend.yaml
+          ACR_NAME=$(echo "${ACR_LOGIN_SERVER}" | cut -d. -f1)
+          az aks update -n "${{ secrets.AKS_CLUSTER }}" -g "${{ secrets.AKS_RG }}" --attach-acr "$ACR_NAME" || true
 
-      - name: Logout from Azure (AKS deployment)
-        run: az logout
+      - name: Ensure namespace (optional)
+        if: env.NAMESPACE != ''
+        run: |
+          kubectl get ns "$NAMESPACE" || kubectl create ns "$NAMESPACE"
+
+      # Apply a manifest if present; otherwise create minimal Deployment/Service inline
+      - name: Apply frontend manifests (if repo has them)
+        run: |
+          set -e
+          if [ -f k8s/frontend.yaml ]; then
+            kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f k8s/frontend.yaml
+          elif [ -d k8s/frontend ]; then
+            kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f k8s/frontend/
+          else
+            echo "::notice::No k8s/frontend* found; creating minimal resources inline."
+            kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f - <<'YAML'
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata: { name: frontend }
+            spec:
+              replicas: 1
+              selector: { matchLabels: { app: frontend } }
+              template:
+                metadata: { labels: { app: frontend } }
+                spec:
+                  containers:
+                    - name: frontend
+                      image: nginx:alpine   # replaced below with your ACR image
+                      ports: [ { containerPort: 80 } ]
+                      readinessProbe: { httpGet: { path: /, port: 80 }, initialDelaySeconds: 5, periodSeconds: 10 }
+                      livenessProbe:  { httpGet: { path: /, port: 80 }, initialDelaySeconds: 10, periodSeconds: 20 }
+            ---
+            apiVersion: v1
+            kind: Service
+            metadata: { name: frontend }
+            spec:
+              type: LoadBalancer
+              selector: { app: frontend }
+              ports: [ { port: 80, targetPort: 80 } ]
+            YAML
+          fi
+
+      - name: Set image to ACR tag and rollout
+        run: |
+          IMG="${ACR_LOGIN_SERVER}/frontend:${TAG}"
+          kubectl ${NAMESPACE:+-n $NAMESPACE} set image deploy/frontend frontend="$IMG" --record || true
+          kubectl ${NAMESPACE:+-n $NAMESPACE} rollout status deploy/frontend --timeout=240s || true
+
+      - name: Show services
+        run: kubectl ${NAMESPACE:+-n $NAMESPACE} get svc -o wide
