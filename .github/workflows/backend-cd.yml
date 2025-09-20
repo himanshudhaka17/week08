@@ -3,99 +3,132 @@ name: CD - Deploy Backend Services to AKS
 on:
   workflow_dispatch:
     inputs:
-      aks_cluster_name:
-        description: 'Name of the AKS Cluster to deploy to'
-        required: true
-        default: '<aks_cluster_name>'
-      aks_resource_group:
-        description: 'Resource Group of the AKS Cluster'
-        required: true
-        default: '<resource_group_name>'
-      aks_acr_name:
-        description: 'Name of ACR'
-        required: true
-        default: '<acr_name>'
+      image_tag:
+        description: "Image tag to deploy (default: latest)"
+        required: false
+        default: "latest"
+
+env:
+  # Change if your manifests use a different namespace (empty = default namespace)
+  NAMESPACE: ""
 
 jobs:
   deploy_backend:
     runs-on: ubuntu-latest
     environment: Production
-    
+
     outputs:
-      PRODUCT_API_IP: ${{ steps.get_product_ip.outputs.external_ip }}
-      ORDER_API_IP: ${{ steps.get_order_ip.outputs.external_ip }}
+      PRODUCT_API_IP: ${{ steps.capture_ips.outputs.product_ip }}
+      ORDER_API_IP:   ${{ steps.capture_ips.outputs.order_ip }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Log in to Azure
-        uses: azure/login@v1
+      - name: Azure login
+        uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-          enable-AzPSSession: true
 
-      - name: Set Kubernetes context (get AKS credentials)
+      - name: Derive ACR vars
+        id: acr
         run: |
-          az aks get-credentials --resource-group ${{ github.event.inputs.aks_resource_group }} --name ${{ github.event.inputs.aks_cluster_name }} --overwrite-existing
+          echo "ACR_LOGIN_SERVER=${{ secrets.ACR_LOGIN_SERVER }}" >> $GITHUB_ENV
+          echo "ACR_NAME=$(echo '${{ secrets.ACR_LOGIN_SERVER }}' | cut -d. -f1)" >> $GITHUB_ENV
+          echo "TAG=${{ github.event.inputs.image_tag || 'latest' }}" >> $GITHUB_ENV
 
-      - name: Attach ACR
-        run: |
-          az aks update --name ${{ github.event.inputs.aks_cluster_name }} --resource-group ${{ github.event.inputs.aks_resource_group }} --attach-acr ${{ github.event.inputs.aks_acr_name }}
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ secrets.AKS_RG }}
+          cluster-name:   ${{ secrets.AKS_CLUSTER }}
 
-      - name: Deploy Backend Infrastructure (Namespace, ConfigMaps, Secrets, Databases)
+      # harmless if already attached
+      - name: Attach ACR permissions
         run: |
-          echo "Deploying backend infrastructure..."
-          cd k8s/
-          kubectl apply -f configmaps.yaml
-          kubectl apply -f secrets.yaml
-          kubectl apply -f product-db.yaml
-          kubectl apply -f order-db.yaml
+          az aks update -n "${{ secrets.AKS_CLUSTER }}" -g "${{ secrets.AKS_RG }}" --attach-acr "$ACR_NAME"
 
-      - name: Deploy Backend Microservices (Product, Order)
+      - name: Create namespace if set (optional)
+        if: env.NAMESPACE != ''
         run: |
-          echo "Deploying backend microservices..."
-          cd k8s/
-          kubectl apply -f product-service.yaml
-          kubectl apply -f order-service.yaml
-      
-      - name: Wait for Backend LoadBalancer IPs
+          kubectl get ns "$NAMESPACE" || kubectl create ns "$NAMESPACE"
+
+      - name: Apply backend manifests
         run: |
-          echo "Waiting for Product, Order LoadBalancer IPs to be assigned (up to 5 minutes)..."
+          set -e
+          # If your k8s yaml files are elsewhere, adjust these paths.
+          if [ -d k8s ]; then
+            kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f k8s/
+          elif [ -d kubernetes/backend ]; then
+            kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f kubernetes/backend/
+          else
+            echo "::warning::No 'k8s' folder found. Continuing to set images/rollout."
+          fi
+
+      - name: Update images & rollout
+        run: |
+          set -e
+          ns_flag=""
+          [ -n "$NAMESPACE" ] && ns_flag="-n $NAMESPACE"
+
+          # Image repos match CI pushes: product_service & order_service
+          PRODUCT_IMG="${ACR_LOGIN_SERVER}/product_service:${TAG}"
+          ORDER_IMG="${ACR_LOGIN_SERVER}/order_service:${TAG}"
+
+          # Try both common deployment names and both container names (dash/underscore)
+          for dep in product-service-w08e1 product-service; do
+            kubectl $ns_flag set image deploy/$dep product-service=$PRODUCT_IMG --record || true
+            kubectl $ns_flag set image deploy/$dep product_service=$PRODUCT_IMG --record || true
+            kubectl $ns_flag rollout status deploy/$dep --timeout=180s || true
+          done
+
+          for dep in order-service-w08e1 order-service; do
+            kubectl $ns_flag set image deploy/$dep order-service=$ORDER_IMG --record || true
+            kubectl $ns_flag set image deploy/$dep order_service=$ORDER_IMG --record || true
+            kubectl $ns_flag rollout status deploy/$dep --timeout=180s || true
+          done
+
+      - name: Wait for LoadBalancer IPs (up to 5 minutes)
+        id: capture_ips
+        run: |
+          set -e
+          ns_flag=""
+          [ -n "$NAMESPACE" ] && ns_flag="-n $NAMESPACE"
+
+          svc_names_product=("product-service-w08e1" "product-service")
+          svc_names_order=("order-service-w08e1" "order-service")
+
           PRODUCT_IP=""
           ORDER_IP=""
-          
-          for i in $(seq 1 60); do
-            echo "Attempt $i/60 to get IPs..."
-            PRODUCT_IP=$(kubectl get service product-service-w08e1 -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-            ORDER_IP=$(kubectl get service order-service-w08e1 -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 
-            if [[ -n "$PRODUCT_IP" && -n "$ORDER_IP" ]]; then
-              echo "All backend LoadBalancer IPs assigned!"
+          for i in $(seq 1 60); do
+            echo "Attempt $i/60 to get external IPs ..."
+            for s in "${svc_names_product[@]}"; do
+              ip=$(kubectl $ns_flag get svc "$s" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+              [ -n "$ip" ] && PRODUCT_IP="$ip" && break
+            done
+            for s in "${svc_names_order[@]}"; do
+              ip=$(kubectl $ns_flag get svc "$s" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+              [ -n "$ip" ] && ORDER_IP="$ip" && break
+            done
+            if [ -n "$PRODUCT_IP" ] && [ -n "$ORDER_IP" ]; then
               echo "Product Service IP: $PRODUCT_IP"
-              echo "Order Service IP: $ORDER_IP"
+              echo "Order Service IP:   $ORDER_IP"
               break
             fi
-            sleep 5 # Wait 5 seconds before next attempt
+            sleep 5
           done
-          
-          if [[ -z "$PRODUCT_IP" || -z "$ORDER_IP" ]]; then
-            echo "Error: One or more LoadBalancer IPs not assigned after timeout."
-            exit 1 # Fail the job if IPs are not obtained
+
+          if [ -z "$PRODUCT_IP" ] || [ -z "$ORDER_IP" ]; then
+            echo "::error::One or more LoadBalancer IPs not assigned after timeout."
+            exit 1
           fi
-          
-          # These are environment variables for subsequent steps in the *same job*
-          # And used to set the job outputs
+
+          echo "product_ip=$PRODUCT_IP" >> $GITHUB_OUTPUT
+          echo "order_ip=$ORDER_IP"     >> $GITHUB_OUTPUT
           echo "PRODUCT_IP=$PRODUCT_IP" >> $GITHUB_ENV
-          echo "ORDER_IP=$ORDER_IP" >> $GITHUB_ENV
+          echo "ORDER_IP=$ORDER_IP"     >> $GITHUB_ENV
 
-      - name: Capture Product Service IP for Workflow Output
-        id: get_product_ip
-        run: echo "external_ip=${{ env.PRODUCT_IP }}" >> $GITHUB_OUTPUT
-      
-      - name: Capture Order Service IP for Workflow Output
-        id: get_order_ip
-        run: echo "external_ip=${{ env.ORDER_IP }}" >> $GITHUB_OUTPUT
-
-      - name: Logout from Azure
-        run: az logout
+      - name: Show services
+        run: |
+          kubectl ${NAMESPACE:+-n $NAMESPACE} get svc -o wide
