@@ -26,10 +26,14 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Derive ACR + tag
+      - name: Derive env (ACR, TAG, node RG)
+        shell: bash
         run: |
           echo "ACR_LOGIN_SERVER=${{ secrets.ACR_LOGIN_SERVER }}" >> $GITHUB_ENV
           echo "TAG=${{ github.event.inputs.image_tag || 'latest' }}" >> $GITHUB_ENV
+          NODE_RG=$(az aks show -n "${{ secrets.AKS_CLUSTER }}" -g "${{ secrets.AKS_RG }}" --query nodeResourceGroup -o tsv)
+          echo "NODE_RG=$NODE_RG" >> $GITHUB_ENV
+          echo "Node RG: $NODE_RG"
 
       - name: Set AKS context
         uses: azure/aks-set-context@v4
@@ -37,8 +41,9 @@ jobs:
           resource-group: ${{ secrets.AKS_RG }}
           cluster-name:   ${{ secrets.AKS_CLUSTER }}
 
-      # Harmless if already attached; don't fail the job if it is.
-      - name: Attach ACR permissions (best effort)
+      # If ACR was never attached to the cluster, attach it (no-op otherwise).
+      - name: Attach ACR to AKS (best effort)
+        shell: bash
         run: |
           ACR_NAME=$(echo "${ACR_LOGIN_SERVER}" | cut -d. -f1)
           az aks update -n "${{ secrets.AKS_CLUSTER }}" -g "${{ secrets.AKS_RG }}" --attach-acr "$ACR_NAME" || true
@@ -49,16 +54,17 @@ jobs:
           kubectl get ns "$NAMESPACE" || kubectl create ns "$NAMESPACE"
 
       - name: Ensure frontend Deployment & Service
+        shell: bash
         run: |
           if [ -f k8s/frontend.yaml ]; then
             kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f k8s/frontend.yaml
           elif [ -d k8s/frontend ]; then
             kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f k8s/frontend/
           else
-            kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f - <<'YAML'
+            cat <<'YAML' | kubectl ${NAMESPACE:+-n $NAMESPACE} apply -f -
             apiVersion: apps/v1
             kind: Deployment
-            metadata: { name: frontend }
+            metadata: { name: frontend, labels: { app: frontend } }
             spec:
               replicas: 1
               selector: { matchLabels: { app: frontend } }
@@ -67,14 +73,14 @@ jobs:
                 spec:
                   containers:
                     - name: frontend
-                      image: nginx:alpine   # replaced below with your ACR image
+                      image: nginx:alpine
                       ports: [ { containerPort: 80 } ]
                       readinessProbe: { httpGet: { path: /, port: 80 }, initialDelaySeconds: 5, periodSeconds: 10 }
                       livenessProbe:  { httpGet: { path: /, port: 80 }, initialDelaySeconds: 10, periodSeconds: 20 }
             ---
             apiVersion: v1
             kind: Service
-            metadata: { name: frontend }
+            metadata: { name: frontend, labels: { app: frontend } }
             spec:
               type: LoadBalancer
               selector: { app: frontend }
@@ -82,11 +88,44 @@ jobs:
             YAML
           fi
 
+      # Free public IP quota by making backends internal (no error if already ClusterIP)
+      - name: Make backend services ClusterIP (free PIPs) – best effort
+        shell: bash
+        run: |
+          kubectl patch svc product-service -p '{"spec":{"type":"ClusterIP"}}' || true
+          kubectl patch svc order-service   -p '{"spec":{"type":"ClusterIP"}}' || true
+
+      # Make sure AKS knows the node RG where PIPs live
+      - name: Annotate frontend Service with node RG
+        shell: bash
+        run: |
+          kubectl annotate svc frontend service.beta.kubernetes.io/azure-load-balancer-resource-group="$NODE_RG" --overwrite || true
+
       - name: Set image to ACR tag and rollout
+        shell: bash
         run: |
           IMG="${ACR_LOGIN_SERVER}/frontend:${TAG}"
           kubectl ${NAMESPACE:+-n $NAMESPACE} set image deploy/frontend frontend="$IMG" --record || true
           kubectl ${NAMESPACE:+-n $NAMESPACE} rollout status deploy/frontend --timeout=240s || true
 
-      - name: Show services
+      - name: Wait for frontend EXTERNAL-IP (soft wait, no fail)
+        shell: bash
+        run: |
+          echo "Waiting up to 5 minutes for an external IP..."
+          for i in {1..60}; do
+            IP=$(kubectl ${NAMESPACE:+-n $NAMESPACE} get svc frontend -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            if [ -n "$IP" ]; then
+              echo "EXTERNAL-IP=$IP"
+              echo "FRONTEND_IP=$IP" >> $GITHUB_ENV
+              break
+            fi
+            sleep 5
+          done
+          kubectl ${NAMESPACE:+-n $NAMESPACE} get svc frontend -o wide || true
+
+      - name: Describe frontend Service (diagnostics)
+        if: env.FRONTEND_IP == ''
+        run: kubectl ${NAMESPACE:+-n $NAMESPACE} describe svc frontend || true
+
+      - name: Show services (final)
         run: kubectl ${NAMESPACE:+-n $NAMESPACE} get svc -o wide
