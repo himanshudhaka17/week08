@@ -37,7 +37,7 @@ jobs:
           resource-group: ${{ secrets.AKS_RG }}
           cluster-name:   ${{ secrets.AKS_CLUSTER }}
 
-      # Harmless if already attached; don't fail if it is.
+      # Harmless if already attached; don't fail the job if it is.
       - name: Attach ACR permissions (best effort)
         run: |
           ACR_NAME=$(echo "${ACR_LOGIN_SERVER}" | cut -d. -f1)
@@ -48,7 +48,6 @@ jobs:
         run: |
           kubectl get ns "$NAMESPACE" || kubectl create ns "$NAMESPACE"
 
-      # Apply repo manifests if present; otherwise create minimal resources inline
       - name: Ensure frontend Deployment & Service
         run: |
           if [ -f k8s/frontend.yaml ]; then
@@ -68,7 +67,7 @@ jobs:
                 spec:
                   containers:
                     - name: frontend
-                      image: nginx:alpine   # replaced below
+                      image: nginx:alpine   # replaced below with your ACR image
                       ports: [ { containerPort: 80 } ]
                       readinessProbe: { httpGet: { path: /, port: 80 }, initialDelaySeconds: 5, periodSeconds: 10 }
                       livenessProbe:  { httpGet: { path: /, port: 80 }, initialDelaySeconds: 10, periodSeconds: 20 }
