@@ -3,24 +3,16 @@
 name: Frontend CI - Build & Push Image
 
 on:
-  # Manual trigger
   workflow_dispatch:
-
-  # Automatically on pushes to main branch
   push:
-    branches:
-      - main
-    paths: # Only trigger if changes are in the frontend directory
+    branches: [ main ]
+    paths:
       - 'frontend/**'
-      - '.github/workflows/frontend_ci.yml' # Trigger if this workflow file changes
+      - '.github/workflows/frontend_ci.yml'
 
-# Define global environment variables that can be used across jobs
 env:
-  # ACR Login Server (e.g., myregistry.azurecr.io)
-  # This needs to be set as a GitHub Repository Secret
-  ACR_LOGIN_SERVER: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
-  # Dynamically generate image tags based on Git SHA and GitHub Run ID
-  # This provides unique, traceable tags for each image build
+  # Use the secret you actually created
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
   IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}
 
 jobs:
@@ -28,26 +20,47 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    # Azure login using a Service Principal secret
-    - name: Azure Login
-      uses: azure/login@v1
-      with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Setup Node (optional build step)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
 
-    # Login to Azure Container Registry (ACR)
-    - name: Login to Azure Container Registry
-      run: az acr login --name ${{ env.ACR_LOGIN_SERVER }}
+      - name: Install & build frontend if package.json exists
+        run: |
+          if [ -f frontend/package.json ]; then
+            npm ci --prefix frontend
+            npm --prefix frontend run build --if-present || true
+          else
+            echo "No package.json found in frontend/. Skipping npm build."
+          fi
 
-    # Build and Push Docker image for Frontend
-    - name: Build and Push Frontend Image
-      run: |
-        docker build -t ${{ env.ACR_LOGIN_SERVER }}/frontend:latest ./frontend/
-        docker push ${{ env.ACR_LOGIN_SERVER }}/frontend:latest
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-    # Logout from Azure for security (runs even if image push fails)
-    - name: Logout from Azure
-      run: az logout
-      if: always()
+      - name: Login to ACR
+        run: |
+          # az acr login expects the ACR NAME, not the FQDN
+          ACR_NAME=$(echo "${{ env.ACR_LOGIN_SERVER }}" | cut -d. -f1)
+          echo "Logging in to ACR: $ACR_NAME (from ${ACR_LOGIN_SERVER})"
+          az acr login --name "$ACR_NAME"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push frontend image
+        env:
+          IMG_BASE: ${{ env.ACR_LOGIN_SERVER }}/frontend
+        run: |
+          # Requires a Dockerfile in ./frontend (see note below)
+          docker build -t "$IMG_BASE:${{ env.IMAGE_TAG }}" -t "$IMG_BASE:latest" ./frontend
+          docker push "$IMG_BASE:${{ env.IMAGE_TAG }}"
+          docker push "$IMG_BASE:latest"
+
+      - name: Logout from Azure
+        if: always()
+        run: az logout
