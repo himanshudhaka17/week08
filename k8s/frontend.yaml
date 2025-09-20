@@ -1,50 +1,33 @@
 # week08/k8s/frontend.yaml
 
+# week08/k8s/frontend.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: frontend
-  labels:
-    app: frontend
+  labels: { app: frontend }
 spec:
   replicas: 1
-  selector:
-    matchLabels:
-      app: frontend
+  selector: { matchLabels: { app: frontend } }
   template:
-    metadata:
-      labels:
-        app: frontend
+    metadata: { labels: { app: frontend } }
     spec:
       containers:
-        # MUST be 'frontend' so the CD step "kubectl set image deploy/frontend frontend=..." works
-        - name: frontend
-          # Placeholder image; the CD workflow will replace this with:
-          #   <your ACR login server>/frontend:latest
-          image: nginx:alpine
+        - name: frontend              # <- must be 'frontend'
+          image: nginx:alpine         # placeholder; CD sets ACR image
           imagePullPolicy: IfNotPresent
-          ports:
-            - containerPort: 80
-          readinessProbe:
-            httpGet: { path: /, port: 80 }
-            initialDelaySeconds: 5
-            periodSeconds: 10
-          livenessProbe:
-            httpGet: { path: /, port: 80 }
-            initialDelaySeconds: 10
-            periodSeconds: 20
+          ports: [ { containerPort: 80 } ]
+          readinessProbe: { httpGet: { path: /, port: 80 }, initialDelaySeconds: 5, periodSeconds: 10 }
+          livenessProbe:  { httpGet: { path: /, port: 80 }, initialDelaySeconds: 10, periodSeconds: 20 }
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  # MUST be 'frontend' to match the CD logs/S23 screenshot
-  name: frontend
-  labels:
-    app: frontend
+  name: frontend                     # <- must be 'frontend'
+  labels: { app: frontend }
 spec:
-  selector:
-    app: frontend
   type: LoadBalancer
+  selector: { app: frontend }
   ports:
     - name: http
       port: 80
