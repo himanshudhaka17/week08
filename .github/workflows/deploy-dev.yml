@@ -1,0 +1,29 @@
+name: Build & Deploy (development)
+
+on:
+  push:
+    branches: [ development ]
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  product:
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      service_name: product-service
+      docker_context: example-1/backend/product_Service
+      image_name: product-service
+      environment: dev
+      namespace: dev
+
+  frontend:
+    uses: ./.github/workflows/reusable-deploy.yml
+    needs: product
+    with:
+      service_name: frontend
+      docker_context: example-1/frontend
+      image_name: frontend
+      environment: dev
+      namespace: dev
