@@ -1,7 +1,8 @@
-# small change to trigger PR CI (dev branch)
 name: Reusable CI
+
 on:
   workflow_call:
+
 jobs:
   ci:
     runs-on: ubuntu-latest
