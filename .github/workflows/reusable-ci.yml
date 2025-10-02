@@ -1,0 +1,21 @@
+# small change to trigger PR CI (dev branch)
+name: Reusable CI
+on:
+  workflow_call:
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+      - name: Install dependencies
+        run: cd ${{ matrix.service }} && npm install
+      - name: Run tests
+        run: cd ${{ matrix.service }} && npm test
