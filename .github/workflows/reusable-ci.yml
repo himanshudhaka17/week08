@@ -34,8 +34,8 @@ jobs:
       - name: List files in ${{ matrix.path }}
         if: steps.verify.outputs.exists == 'true'
         run: |
-            echo "Directory: ${{ matrix.path }}"
-            ls -la "${{ matrix.path }}"
+          echo "Directory: ${{ matrix.path }}"
+          ls -la "${{ matrix.path }}"
 
       - name: Basic YAML lint (workflows)
         run: |
@@ -57,7 +57,7 @@ PY
 
       - name: Skip note if directory missing
         if: steps.verify.outputs.exists != 'true'
-        run: echo "No directory '${{ matrix.path }}' in this repo — skipping this matrix entry."
+        run: echo "No directory '${{ matrix.path }}' — skipping this matrix entry."
 
       - name: Done
         run: echo "Reusable CI completed for '${{ matrix.path }}'."
