@@ -14,15 +14,11 @@ jobs:
           - id: frontend
             path: frontend
 
-    defaults:
-      run:
-        shell: bash
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify directory exists
+      - name: Verify path exists
         id: verify
         run: |
           if [ -d "${{ matrix.path }}" ]; then
@@ -31,33 +27,15 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: List files in ${{ matrix.path }}
+      - name: List files (if exists)
         if: steps.verify.outputs.exists == 'true'
         run: |
           echo "Directory: ${{ matrix.path }}"
           ls -la "${{ matrix.path }}"
 
-      - name: Basic YAML lint (workflows)
-        run: |
-          echo "Linting YAML in .github/workflows"
-          python3 - <<'PY'
-import os, sys, yaml
-base = ".github/workflows"
-ok = True
-for f in os.listdir(base):
-    if f.endswith((".yml",".yaml")):
-        try:
-            yaml.safe_load(open(os.path.join(base,f)))
-            print("OK  ", f)
-        except Exception as e:
-            print("FAIL", f, e)
-            ok = False
-if not ok: sys.exit(1)
-PY
-
-      - name: Skip note if directory missing
+      - name: No-op when missing
         if: steps.verify.outputs.exists != 'true'
-        run: echo "No directory '${{ matrix.path }}' — skipping this matrix entry."
+        run: echo "No directory '${{ matrix.path }}' — skipping."
 
-      - name: Done
+      - name: Finished
         run: echo "Reusable CI completed for '${{ matrix.path }}'."
