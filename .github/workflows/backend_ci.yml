@@ -11,9 +11,7 @@ on:
       - '.github/workflows/backend_ci.yml'
 
 env:
-  # Use the secret you created in Step 3 (FQDN like sit722acr12345.azurecr.io)
-  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
-  # Unique tag per run for traceability
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}           # e.g. acrhimanshuweek08.azurecr.io
   IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}
 
 jobs:
@@ -93,16 +91,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Azure login
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      # ACR login must use the short registry name (no .azurecr.io)
-      - name: Login to Azure Container Registry
+      # 🧪 Login to ACR with repo secrets (no az CLI needed)
+      - name: Docker login to ACR
         run: |
-          ACR_NAME=$(echo "${{ env.ACR_LOGIN_SERVER }}" | cut -d. -f1)
-          az acr login --name "$ACR_NAME"
+          echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login "${{ env.REGISTRY }}" \
+            -u "${{ secrets.REGISTRY_USERNAME }}" --password-stdin
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -110,7 +103,7 @@ jobs:
       # Build & push product_service
       - name: Build & push product_service
         env:
-          IMG_BASE: ${{ env.ACR_LOGIN_SERVER }}/product_service
+          IMG_BASE: ${{ env.REGISTRY }}/product_service
         run: |
           docker build -t "$IMG_BASE:${{ env.IMAGE_TAG }}" ./backend/product_service
           docker tag  "$IMG_BASE:${{ env.IMAGE_TAG }}" "$IMG_BASE:latest"
@@ -120,13 +113,13 @@ jobs:
       # Build & push order_service
       - name: Build & push order_service
         env:
-          IMG_BASE: ${{ env.ACR_LOGIN_SERVER }}/order_service
+          IMG_BASE: ${{ env.REGISTRY }}/order_service
         run: |
           docker build -t "$IMG_BASE:${{ env.IMAGE_TAG }}" ./backend/order_service
           docker tag  "$IMG_BASE:${{ env.IMAGE_TAG }}" "$IMG_BASE:latest"
           docker push "$IMG_BASE:${{ env.IMAGE_TAG }}"
           docker push "$IMG_BASE:latest"
 
-      - name: Logout from Azure
+      - name: Docker logout
         if: always()
-        run: az logout
+        run: docker logout "${{ env.REGISTRY }}"
