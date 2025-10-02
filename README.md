@@ -39,3 +39,5 @@ Ensure you replace all placeholders value to actual values.
 
 > CI retrigger: [View PR #2 checks](../../pull/2)
 
+CI trigger test
+
