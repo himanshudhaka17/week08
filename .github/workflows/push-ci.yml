@@ -1,0 +1,8 @@
+name: Push CI
+on:
+  push:
+    branches: [main, development]
+
+jobs:
+  run-ci:
+    uses: ./.github/workflows/reusable-ci.yml
