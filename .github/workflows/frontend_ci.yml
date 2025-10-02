@@ -1,6 +1,5 @@
 # week08/.github/workflows/frontend_ci.yml
-
-name: Frontend CI - Build & Push Image
+name: Frontend CI — Build & Push Image
 
 on:
   workflow_dispatch:
@@ -11,7 +10,7 @@ on:
       - '.github/workflows/frontend_ci.yml'
 
 env:
-  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
   IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}
 
 jobs:
@@ -22,7 +21,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 🔧 Always write the backend IPs into config.js (no heredoc, no sed)
+      # 🔧 Always write the backend IPs into config.js
       - name: Write backend IPs into config.js
         run: |
           mkdir -p frontend/src
@@ -33,28 +32,24 @@ jobs:
           echo "----- frontend/src/config.js -----"
           cat frontend/src/config.js
 
-      - name: Azure login
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Login to ACR
+      # 🧪 Login to ACR with repo secrets (no az CLI needed)
+      - name: Docker login to ACR
         run: |
-          ACR_NAME=$(echo "${{ env.ACR_LOGIN_SERVER }}" | cut -d. -f1)
-          az acr login --name "$ACR_NAME"
+          echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login "${{ env.REGISTRY }}" \
+            -u "${{ secrets.REGISTRY_USERNAME }}" --password-stdin
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Build & push frontend image
         env:
-          IMG_BASE: ${{ env.ACR_LOGIN_SERVER }}/frontend
+          IMG_BASE: ${{ env.REGISTRY }}/frontend
         run: |
           test -f frontend/Dockerfile || { echo "Missing frontend/Dockerfile"; exit 1; }
           docker build -t "$IMG_BASE:${{ env.IMAGE_TAG }}" -t "$IMG_BASE:latest" ./frontend
           docker push "$IMG_BASE:${{ env.IMAGE_TAG }}"
           docker push "$IMG_BASE:latest"
 
-      - name: Logout from Azure
+      - name: Docker logout
         if: always()
-        run: az logout
+        run: docker logout "${{ env.REGISTRY }}"
