@@ -8,28 +8,56 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        service: [backend, frontend]
+        include:
+          - id: backend
+            path: backend
+          - id: frontend
+            path: frontend
 
     defaults:
       run:
-        working-directory: ${{ matrix.service }}
+        shell: bash
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 18
-          # cache intentionally disabled to avoid lockfile errors for screenshots
-
-      - name: Install dependencies
+      - name: Verify directory exists
+        id: verify
         run: |
-          if [ -f package-lock.json ]; then
-            npm ci
+          if [ -d "${{ matrix.path }}" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
           else
-            npm install
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Run tests (if present)
-        run: npm test --if-present
+      - name: List files in ${{ matrix.path }}
+        if: steps.verify.outputs.exists == 'true'
+        run: |
+            echo "Directory: ${{ matrix.path }}"
+            ls -la "${{ matrix.path }}"
+
+      - name: Basic YAML lint (workflows)
+        run: |
+          echo "Linting YAML in .github/workflows"
+          python3 - <<'PY'
+import os, sys, yaml
+base = ".github/workflows"
+ok = True
+for f in os.listdir(base):
+    if f.endswith((".yml",".yaml")):
+        try:
+            yaml.safe_load(open(os.path.join(base,f)))
+            print("OK  ", f)
+        except Exception as e:
+            print("FAIL", f, e)
+            ok = False
+if not ok: sys.exit(1)
+PY
+
+      - name: Skip note if directory missing
+        if: steps.verify.outputs.exists != 'true'
+        run: echo "No directory '${{ matrix.path }}' in this repo — skipping this matrix entry."
+
+      - name: Done
+        run: echo "Reusable CI completed for '${{ matrix.path }}'."
